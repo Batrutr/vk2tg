@@ -1,0 +1,18 @@
+{
+  "user_states": {
+    "604906172": {
+      "current_chat": 2000000072,
+      "isChat": true
+    },
+    "5026716178": {
+      "current_chat": 2000000068,
+      "isChat": true
+    }
+  },
+  "tg_ids": [
+    604906172,
+    5026716178
+  ],
+  "current_chat": 2000000072,
+  "isChat": true
+}

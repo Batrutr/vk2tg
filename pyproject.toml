@@ -1,0 +1,11 @@
+[project]
+name = "vk-to-telegram"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "loguru>=0.7.3",
+    "pytelegrambotapi>=4.32.0",
+    "requests>=2.33.1",
+    "vk-api>=11.10.0",
+]

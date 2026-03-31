@@ -1,0 +1,12 @@
+services:
+  vk-to-telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vk-to-telegram-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data.json:/app/data.json
+      - ./chats.json:/app/chats.json

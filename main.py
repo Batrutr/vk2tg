@@ -61,18 +61,47 @@ upload = VkUpload(vk_session)
 
 # ─── User state ───────────────────────────────────────────────────────────────
 
+CHAT_PEER_OFFSET = 2_000_000_000
+
+
+def is_chat_peer(peer_id: int) -> bool:
+    return peer_id > CHAT_PEER_OFFSET
+
+
+def peer_kind_label(peer_id: int) -> str:
+    return "беседа" if is_chat_peer(peer_id) else "личка"
+
+
+def parse_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return default
+
 def get_tg_ids() -> list:
-    return data.get("tg_ids", [])
+    return data["tg_ids"]
 
 def get_user_state(user_id: int) -> dict:
-    raw = data.setdefault("user_states", {}).get(str(user_id), {})
+    raw = data["user_states"].get(str(user_id), {})
+    try:
+        current_chat = int(raw.get("current_chat", 0) or 0)
+    except (TypeError, ValueError):
+        current_chat = 0
+    default_is_chat = is_chat_peer(current_chat) if current_chat else False
     return {
-        "current_chat": int(raw.get("current_chat", 0) or 0),
-        "isChat": bool(raw.get("isChat", False)),
+        "current_chat": current_chat,
+        "isChat": parse_bool(raw.get("isChat", default_is_chat), default=default_is_chat),
     }
 
 def set_user_state(user_id: int, current_chat: int, is_chat: bool):
-    data.setdefault("user_states", {})[str(user_id)] = {
+    data["user_states"][str(user_id)] = {
         "current_chat": int(current_chat),
         "isChat": bool(is_chat),
     }
@@ -86,11 +115,11 @@ def is_admin(user_id: int) -> bool:
 
 # Sync orphaned user_states into tg_ids
 _known = set(get_tg_ids())
-for _uid_str in list(data.get("user_states", {})):
+for _uid_str in list(data["user_states"]):
     try:
         _uid = int(_uid_str)
         if _uid not in _known:
-            data.setdefault("tg_ids", []).append(_uid)
+            data["tg_ids"].append(_uid)
             _known.add(_uid)
     except ValueError:
         pass
@@ -100,15 +129,15 @@ save_data()
 
 def resolve_chat_target(key: str) -> tuple[int, bool]:
     value = int(chats[key])
-    return (value, True) if value > 2_000_000_000 else (value, False)
+    return value, is_chat_peer(value)
 
 def get_allowed_peer_ids() -> set[int]:
     allowed = set()
     for key in chats:
         try:
-            peer_id, is_chat = resolve_chat_target(key)
+            peer_id, _ = resolve_chat_target(key)
             allowed.add(peer_id)
-            logger.info(f"✅ '{key}': peer_id={peer_id} ({'беседа' if is_chat else 'личка'})")
+            logger.info(f"✅ '{key}': peer_id={peer_id} ({peer_kind_label(peer_id)})")
         except Exception as e:
             logger.error(f"❌ Не удалось разрешить '{key}': {e}")
     return allowed
@@ -128,9 +157,9 @@ def get_current_chat_name(user_id: int) -> str:
         return "не выбран"
     for name in chats:
         try:
-            peer_id, is_chat = resolve_chat_target(name)
+            peer_id, _ = resolve_chat_target(name)
             if peer_id == current:
-                return name + (" (беседа)" if is_chat else " (личка)")
+                return name + f" ({peer_kind_label(peer_id)})"
         except Exception:
             pass
     return str(current)
@@ -139,7 +168,7 @@ def get_vk_send_kwargs(user_id: int) -> dict | None:
     state = get_user_state(user_id)
     if not state["current_chat"]:
         return None
-    return {"peer_id" if state["isChat"] else "user_id": str(state["current_chat"])}
+    return {"peer_id": state["current_chat"]}
 
 ALLOWED_PEER_IDS = get_allowed_peer_ids()
 
@@ -206,7 +235,7 @@ def cmd_start(message):
             tg.send_message(uid, "ℹ️ Вы уже авторизованы")
             return
 
-        data.setdefault("tg_ids", []).append(uid)
+        data["tg_ids"].append(uid)
         ids = get_tg_ids()
         base_state = get_user_state(ids[0]) if len(ids) > 1 else {"current_chat": 0, "isChat": False}
         set_user_state(uid, base_state["current_chat"], base_state["isChat"])
@@ -254,7 +283,7 @@ def cmd_status(message):
     tg.send_message(message.chat.id, (
         f"*Статус бота*\n\n"
         f"💬 Активный чат: `{get_current_chat_name(message.chat.id)}`\n"
-        f"🔗 Тип: {'Беседа' if state['isChat'] else 'Личка'}\n"
+        f"🔗 Тип: {peer_kind_label(state['current_chat']).capitalize()}\n"
         f"👥 Пользователей: {len(get_tg_ids())}\n"
         f"🎭 Ваша роль: {role}"
     ), parse_mode="Markdown")
@@ -268,7 +297,7 @@ def cmd_mychat(message):
         f"*Ваш текущий чат*\n\n"
         f"💬 Имя: `{get_current_chat_name(message.chat.id)}`\n"
         f"🆔 peer/user id: `{state['current_chat']}`\n"
-        f"🔗 Тип: {'Беседа' if state['isChat'] else 'Личка'}"
+        f"🔗 Тип: {peer_kind_label(state['current_chat']).capitalize()}"
     ), parse_mode="Markdown")
 
 
@@ -289,8 +318,8 @@ def cmd_allowed(message):
     lines = []
     for key in chats:
         try:
-            peer_id, is_chat = resolve_chat_target(key)
-            lines.append(f"- {key}: {peer_id} ({'беседа' if is_chat else 'личка'})")
+            peer_id, _ = resolve_chat_target(key)
+            lines.append(f"- {key}: {peer_id} ({peer_kind_label(peer_id)})")
         except Exception as e:
             lines.append(f"- {key}: ошибка ({e})")
     tg.send_message(message.chat.id, "Разрешённые VK-чаты:\n" + "\n".join(lines))
@@ -323,7 +352,7 @@ def cmd_kick(message):
             return
         ids.remove(target_id)
         data["tg_ids"] = ids
-        data.setdefault("user_states", {}).pop(str(target_id), None)
+        data["user_states"].pop(str(target_id), None)
         save_data()
         tg.send_message(message.chat.id, f"✅ Пользователь `{target_id}` удалён", parse_mode="Markdown")
     except (IndexError, ValueError):

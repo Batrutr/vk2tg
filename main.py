@@ -4,8 +4,9 @@ import json
 import tempfile
 import requests
 import sys
+import random
 from functools import wraps
-from threading import Thread
+from threading import Thread, Lock
 
 import vk_api
 import telebot
@@ -58,6 +59,125 @@ vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk_session._auth_token()
 vk = vk_session.get_api()
 upload = VkUpload(vk_session)
+
+# ─── VK API safety helpers ───────────────────────────────────────────────────
+
+_api_lock = Lock()
+_last_api_call = 0.0
+API_INTERVAL = float(os.getenv("VK_API_INTERVAL", "0.34"))
+VK_PAUSE_6 = float(os.getenv("VK_PAUSE_6", "2"))
+VK_PAUSE_983 = float(os.getenv("VK_PAUSE_983", "30"))
+VK_PAUSE_984 = float(os.getenv("VK_PAUSE_984", "180"))
+
+_vk_pause_until = 0.0
+
+_user_name_cache: dict[int, str] = {}
+_chat_title_cache: dict[int, str] = {}
+
+
+def _extract_vk_error_code(exc: Exception) -> int | None:
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+
+    err = getattr(exc, "error", None)
+    if isinstance(err, dict):
+        code = err.get("error_code")
+        if isinstance(code, int):
+            return code
+
+    args = getattr(exc, "args", ())
+    if args:
+        first = args[0]
+        if isinstance(first, int):
+            return first
+        if isinstance(first, str):
+            for part in first.replace(":", " ").split():
+                if part.isdigit():
+                    return int(part)
+    return None
+
+
+def _register_vk_backoff(error_code: int, attempt: int, base_backoff: float) -> float:
+    global _vk_pause_until
+
+    if error_code == 984:
+        pause = VK_PAUSE_984 + 30.0 * attempt
+    elif error_code == 983:
+        pause = VK_PAUSE_983 + 10.0 * attempt
+    elif error_code == 6:
+        pause = VK_PAUSE_6 + 1.5 * attempt
+    else:
+        pause = base_backoff * max(1, attempt)
+
+    _vk_pause_until = max(_vk_pause_until, time.time() + pause)
+    return pause
+
+
+def vk_call(method, *args, retries: int = 0, backoff: float = 0.7, **kwargs):
+    """Serialize VK API calls with interval and optional retries for transient errors."""
+    global _last_api_call
+    attempt = 0
+    while True:
+        try:
+            with _api_lock:
+                pause_wait = _vk_pause_until - time.time()
+                if pause_wait > 0:
+                    time.sleep(pause_wait)
+                now = time.time()
+                wait = API_INTERVAL - (now - _last_api_call)
+                if wait > 0:
+                    time.sleep(wait)
+                result = method(*args, **kwargs)
+                _last_api_call = time.time()
+                return result
+        except Exception as e:
+            code = _extract_vk_error_code(e)
+            if code in {6, 983, 984}:
+                pause = _register_vk_backoff(code, attempt + 1, backoff)
+                logger.warning(f"VK API code={code}: pause {pause:.1f}s before next calls")
+            if attempt >= retries:
+                raise
+            attempt += 1
+            if code not in {6, 983, 984}:
+                time.sleep(backoff * attempt)
+
+
+def next_random_id() -> int:
+    return random.randint(1, 2_147_483_647)
+
+
+def get_user_name(user_id: int) -> str:
+    name = _user_name_cache.get(user_id)
+    if name:
+        return name
+    try:
+        s = vk_call(vk.users.get, user_ids=user_id, retries=1)[0]
+        name = f"{s['first_name']} {s['last_name']}"
+    except Exception:
+        name = f"ID{user_id}"
+    _user_name_cache[user_id] = name
+    return name
+
+
+def get_chat_title(chat_id: int) -> str:
+    title = _chat_title_cache.get(chat_id)
+    if title:
+        return title
+    try:
+        title = vk_call(vk_session.method, "messages.getChat", {"chat_id": chat_id}, retries=1)["title"]
+    except Exception:
+        title = f"Беседа {chat_id}"
+    _chat_title_cache[chat_id] = title
+    return title
+
+
+def should_fetch_full_message(event) -> bool:
+    attachments = getattr(event, "attachments", None)
+    if attachments:
+        return True
+    extra_values = getattr(event, "extra_values", {}) or {}
+    return any(k in extra_values for k in ("fwd", "reply", "reply_message_id"))
 
 # ─── User state ───────────────────────────────────────────────────────────────
 
@@ -424,9 +544,9 @@ def _send_doc_to_vk(message, file_id: str, title: str = "file", caption: str = "
     try:
         path = download_tg_file(file_id)
         peer_id = get_user_state(uid)["current_chat"]
-        doc = upload.document_message(path, peer_id=peer_id, title=title)
+        doc = vk_call(upload.document_message, path, peer_id=peer_id, title=title, retries=1)
         att = f"doc{doc['owner_id']}_{doc['id']}"
-        vk.messages.send(**send_kwargs, random_id=0, message=caption, attachment=att)
+        vk_call(vk.messages.send, **send_kwargs, random_id=next_random_id(), message=caption, attachment=att, retries=2)
     except Exception as e:
         tg.send_message(uid, f"❌ Ошибка: {e}")
         logger.error(f"_send_doc_to_vk: {e}")
@@ -443,7 +563,7 @@ def on_text(message):
     if not send_kwargs:
         return
     try:
-        vk.messages.send(**send_kwargs, random_id=0, message=message.text)
+        vk_call(vk.messages.send, **send_kwargs, random_id=next_random_id(), message=message.text, retries=2)
     except Exception as e:
         tg.send_message(message.chat.id, f"❌ Ошибка: {e}")
         logger.error(f"on_text: {e}")
@@ -460,9 +580,9 @@ def on_photo(message):
     path = None
     try:
         path = download_tg_file(message.photo[-1].file_id)
-        photos = upload.photo_messages(path)
+        photos = vk_call(upload.photo_messages, path, retries=1)
         att = f"photo{photos[0]['owner_id']}_{photos[0]['id']}"
-        vk.messages.send(**send_kwargs, random_id=0, message=message.caption or "", attachment=att)
+        vk_call(vk.messages.send, **send_kwargs, random_id=next_random_id(), message=message.caption or "", attachment=att, retries=2)
     except Exception as e:
         tg.send_message(uid, f"❌ Ошибка отправки фото: {e}")
         logger.error(f"on_photo: {e}")
@@ -485,9 +605,9 @@ def on_voice(message):
         ogg = path + ".ogg"
         os.rename(path, ogg)
         peer_id = get_user_state(uid)["current_chat"]
-        doc = upload.document_message(ogg, peer_id=peer_id, title="voice.ogg")
+        doc = vk_call(upload.document_message, ogg, peer_id=peer_id, title="voice.ogg", retries=1)
         att = f"doc{doc['owner_id']}_{doc['id']}"
-        vk.messages.send(**send_kwargs, random_id=0, attachment=att)
+        vk_call(vk.messages.send, **send_kwargs, random_id=next_random_id(), attachment=att, retries=2)
     except Exception as e:
         tg.send_message(uid, f"❌ Ошибка отправки голосового: {e}")
         logger.error(f"on_voice: {e}")
@@ -521,11 +641,8 @@ def format_fwd_messages(fwd_messages: list, depth: int = 0) -> str:
     lines = []
     indent = "  " * depth
     for msg in fwd_messages:
-        try:
-            s = vk.users.get(user_ids=msg["from_id"])[0]
-            name = f"{s['first_name']} {s['last_name']}"
-        except Exception:
-            name = f"ID{msg.get('from_id', '?')}"
+        from_id = int(msg.get("from_id", 0) or 0)
+        name = get_user_name(from_id) if from_id else f"ID{msg.get('from_id', '?')}"
         text = msg.get("text", "")
         lines.append(f"{indent}↪ _{name}: {text}_" if text else f"{indent}↪ _{name}_")
         if msg.get("fwd_messages"):
@@ -536,8 +653,7 @@ def format_fwd_messages(fwd_messages: list, depth: int = 0) -> str:
 def get_reply_text(message_data: dict) -> str:
     try:
         reply = message_data["reply_message"]
-        s = vk.users.get(user_ids=reply["from_id"])[0]
-        name = f"{s['first_name']} {s['last_name']}"
+        name = get_user_name(int(reply["from_id"]))
         return f"↩ _{name}_: {reply['text']}"
     except Exception as e:
         logger.error(f"get_reply_text: {e}")
@@ -607,8 +723,21 @@ def vk_work():
                     if event.message_id is None:
                         continue
 
-                    msg = vk.messages.getById(message_ids=event.message_id)["items"][0]
-                    peer_id = msg.get("peer_id") or (
+                    attachments = []
+                    fwd = []
+                    reply = None
+                    msg = None
+
+                    if should_fetch_full_message(event):
+                        try:
+                            msg = vk_call(vk.messages.getById, message_ids=event.message_id)["items"][0]
+                            attachments = msg.get("attachments", [])
+                            fwd = msg.get("fwd_messages", [])
+                            reply = msg.get("reply_message")
+                        except Exception as e:
+                            logger.error(f"getById failed: {e}")
+
+                    peer_id = (msg or {}).get("peer_id") or (
                         2_000_000_000 + event.chat_id if event.from_chat else event.user_id
                     )
 
@@ -616,17 +745,14 @@ def vk_work():
                         logger.debug(f"peer_id={peer_id} не в разрешённых")
                         continue
 
-                    sender = vk.users.get(user_ids=event.user_id)[0]
-                    sender_name = f"{sender['first_name']} {sender['last_name']}"
-                    attachments = msg.get("attachments", [])
-                    fwd = msg.get("fwd_messages", [])
+                    sender_name = get_user_name(event.user_id)
                     parts = []
 
                     if event.from_chat and not event.from_me:
-                        chat_title = vk_session.method("messages.getChat", {"chat_id": event.chat_id})["title"]
+                        chat_title = get_chat_title(event.chat_id)
                         parts.append(f"*{chat_title}*")
-                        if "reply_message" in msg:
-                            parts.append(get_reply_text(msg))
+                        if reply:
+                            parts.append(get_reply_text({"reply_message": reply}))
                         if fwd:
                             parts.append(format_fwd_messages(fwd))
                         if event.message:
@@ -637,8 +763,8 @@ def vk_work():
                         logger.info(f"Беседа '{chat_title}' → TG")
 
                     elif not event.from_me and event.from_user:
-                        if "reply_message" in msg:
-                            parts.append(get_reply_text(msg))
+                        if reply:
+                            parts.append(get_reply_text({"reply_message": reply}))
                         if fwd:
                             parts.append(format_fwd_messages(fwd))
                         if event.message:

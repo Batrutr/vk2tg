@@ -637,13 +637,21 @@ def on_audio(message):
 
 # ─── VK → TG ─────────────────────────────────────────────────────────────────
 
+def escape_md(text: str) -> str:
+    if not text:
+        return text
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
+
 def format_fwd_messages(fwd_messages: list, depth: int = 0) -> str:
     lines = []
     indent = "  " * depth
     for msg in fwd_messages:
         from_id = int(msg.get("from_id", 0) or 0)
-        name = get_user_name(from_id) if from_id else f"ID{msg.get('from_id', '?')}"
-        text = msg.get("text", "")
+        name = escape_md(get_user_name(from_id) if from_id else f"ID{msg.get('from_id', '?')}")
+        text = escape_md(msg.get("text", ""))
         lines.append(f"{indent}↪ _{name}: {text}_" if text else f"{indent}↪ _{name}_")
         if msg.get("fwd_messages"):
             lines.append(format_fwd_messages(msg["fwd_messages"], depth + 1))
@@ -653,23 +661,38 @@ def format_fwd_messages(fwd_messages: list, depth: int = 0) -> str:
 def get_reply_text(message_data: dict) -> str:
     try:
         reply = message_data["reply_message"]
-        name = get_user_name(int(reply["from_id"]))
-        return f"↩ _{name}_: {reply['text']}"
+        name = escape_md(get_user_name(int(reply["from_id"])))
+        text = escape_md(reply["text"])
+        return f"↩ _{name}_: {text}"
     except Exception as e:
         logger.error(f"get_reply_text: {e}")
         return "↩ _ошибка получения ответа_"
 
 
-def handle_attachments(attachments: list, caption: str = ""):
+def handle_attachments(attachments: list, caption: str = "", parse_mode: str | None = None):
+    header_used = not caption
+
+    def flush_header():
+        nonlocal header_used
+        if not header_used:
+            broadcast(caption, parse_mode=parse_mode)
+            header_used = True
+
     for att in attachments:
         att_type = att.get("type")
         try:
             if att_type == "photo":
                 url = sorted(att["photo"]["sizes"], key=lambda x: x.get("width", 0))[-1]["url"]
-                broadcast_media("send_photo", requests.get(url, timeout=30).content, caption=caption or None)
-                caption = ""
+                kw = {}
+                if not header_used:
+                    kw["caption"] = caption
+                    if parse_mode:
+                        kw["parse_mode"] = parse_mode
+                    header_used = True
+                broadcast_media("send_photo", requests.get(url, timeout=30).content, **kw)
 
             elif att_type == "audio_message":
+                flush_header()
                 url = att["audio_message"].get("link_ogg") or att["audio_message"].get("link_mp3")
                 if url:
                     broadcast_media("send_voice", requests.get(url, timeout=30).content)
@@ -677,6 +700,7 @@ def handle_attachments(attachments: list, caption: str = ""):
             elif att_type == "doc":
                 preview = att["doc"].get("preview", {})
                 if "audio_msg" in preview:
+                    flush_header()
                     audio = preview["audio_msg"]
                     url = audio.get("link_ogg") or audio.get("link_mp3")
                     if url:
@@ -684,30 +708,41 @@ def handle_attachments(attachments: list, caption: str = ""):
                 else:
                     url = att["doc"].get("url")
                     if url:
-                        broadcast_media("send_document",
-                                        requests.get(url, timeout=30).content,
-                                        visible_file_name=att["doc"].get("title", "file"))
+                        kw = {"visible_file_name": att["doc"].get("title", "file")}
+                        if not header_used:
+                            kw["caption"] = caption
+                            if parse_mode:
+                                kw["parse_mode"] = parse_mode
+                            header_used = True
+                        broadcast_media("send_document", requests.get(url, timeout=30).content, **kw)
 
             elif att_type == "video":
+                flush_header()
                 v = att["video"]
-                broadcast(f"🎬 *{v.get('title', 'Видео')}*\nhttps://vk.com/video{v['owner_id']}_{v['id']}",
+                url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
+                broadcast(f"🎬 *{escape_md(v.get('title', 'Видео'))}*\n{escape_md(url)}",
                           parse_mode="Markdown")
 
             elif att_type == "audio":
+                flush_header()
                 a = att["audio"]
-                broadcast(f"🎵 *{a.get('artist', '?')} — {a.get('title', '?')}*", parse_mode="Markdown")
+                broadcast(f"🎵 *{escape_md(a.get('artist', '?'))} — {escape_md(a.get('title', '?'))}*", parse_mode="Markdown")
 
             elif att_type == "sticker":
+                flush_header()
                 imgs = att["sticker"].get("images_with_background") or att["sticker"].get("images", [])
                 if imgs:
                     broadcast_media("send_photo", requests.get(imgs[-1]["url"], timeout=30).content)
 
             elif att_type == "link":
+                flush_header()
                 lnk = att["link"]
                 broadcast(f"🔗 {lnk.get('title', '')}\n{lnk.get('url', '')}")
 
         except Exception as e:
             logger.error(f"handle_attachments({att_type}): {e}")
+
+    flush_header()
 
 
 def vk_work():
@@ -750,16 +785,20 @@ def vk_work():
 
                     if event.from_chat and not event.from_me:
                         chat_title = get_chat_title(event.chat_id)
-                        parts.append(f"*{chat_title}*")
+                        parts.append(f"*{escape_md(chat_title)}*")
                         if reply:
                             parts.append(get_reply_text({"reply_message": reply}))
                         if fwd:
                             parts.append(format_fwd_messages(fwd))
+                        sender_line = f"*{escape_md(sender_name)}*"
                         if event.message:
-                            parts.append(f"*{sender_name}*: {event.message}")
-                        broadcast("\n".join(p for p in parts if p), parse_mode="Markdown")
+                            sender_line += f": {escape_md(event.message)}"
+                        parts.append(sender_line)
+                        text = "\n".join(p for p in parts if p)
                         if attachments:
-                            handle_attachments(attachments, caption=f"[{chat_title}] {sender_name}")
+                            handle_attachments(attachments, caption=text, parse_mode="Markdown")
+                        else:
+                            broadcast(text, parse_mode="Markdown")
                         logger.info(f"Беседа '{chat_title}' → TG")
 
                     elif not event.from_me and event.from_user:
@@ -767,12 +806,15 @@ def vk_work():
                             parts.append(get_reply_text({"reply_message": reply}))
                         if fwd:
                             parts.append(format_fwd_messages(fwd))
+                        sender_line = f"*{escape_md(sender_name)}*"
                         if event.message:
-                            parts.append(f"*{sender_name}*: {event.message}")
-                        if parts:
-                            broadcast("\n".join(parts), parse_mode="Markdown")
+                            sender_line += f": {escape_md(event.message)}"
+                        parts.append(sender_line)
+                        text = "\n".join(p for p in parts if p)
                         if attachments:
-                            handle_attachments(attachments, caption=sender_name)
+                            handle_attachments(attachments, caption=text, parse_mode="Markdown")
+                        else:
+                            broadcast(text, parse_mode="Markdown")
                         logger.info(f"Личка {sender_name} → TG")
 
                 except Exception as e:

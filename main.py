@@ -11,7 +11,7 @@ from threading import Thread, Lock
 import vk_api
 import telebot
 from telebot import types
-from vk_api.longpoll import VkLongPoll
+from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.upload import VkUpload
 from loguru import logger
 
@@ -670,6 +670,10 @@ def get_reply_text(message_data: dict) -> str:
 
 
 def handle_attachments(attachments: list, caption: str = "", parse_mode: str | None = None):
+    if caption and len(caption) > 1024:
+        broadcast(caption, parse_mode=parse_mode)
+        caption = ""
+        parse_mode = None
     header_used = not caption
 
     def flush_header():
@@ -716,28 +720,11 @@ def handle_attachments(attachments: list, caption: str = "", parse_mode: str | N
                             header_used = True
                         broadcast_media("send_document", requests.get(url, timeout=30).content, **kw)
 
-            elif att_type == "video":
-                flush_header()
-                v = att["video"]
-                url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
-                broadcast(f"🎬 *{escape_md(v.get('title', 'Видео'))}*\n{escape_md(url)}",
-                          parse_mode="Markdown")
-
-            elif att_type == "audio":
-                flush_header()
-                a = att["audio"]
-                broadcast(f"🎵 *{escape_md(a.get('artist', '?'))} — {escape_md(a.get('title', '?'))}*", parse_mode="Markdown")
-
             elif att_type == "sticker":
                 flush_header()
                 imgs = att["sticker"].get("images_with_background") or att["sticker"].get("images", [])
                 if imgs:
                     broadcast_media("send_photo", requests.get(imgs[-1]["url"], timeout=30).content)
-
-            elif att_type == "link":
-                flush_header()
-                lnk = att["link"]
-                broadcast(f"🔗 {lnk.get('title', '')}\n{lnk.get('url', '')}")
 
         except Exception as e:
             logger.error(f"handle_attachments({att_type}): {e}")
@@ -758,12 +745,13 @@ def vk_work():
                     if event.message_id is None:
                         continue
 
+                    is_edit = event.type == VkEventType.MESSAGE_EDIT
                     attachments = []
                     fwd = []
                     reply = None
                     msg = None
 
-                    if should_fetch_full_message(event):
+                    if is_edit or should_fetch_full_message(event):
                         try:
                             msg = vk_call(vk.messages.getById, message_ids=event.message_id)["items"][0]
                             attachments = msg.get("attachments", [])
@@ -780,7 +768,9 @@ def vk_work():
                         logger.debug(f"peer_id={peer_id} не в разрешённых")
                         continue
 
-                    sender_name = get_user_name(event.user_id)
+                    sender_id = (msg or {}).get("from_id") or event.user_id
+                    sender_name = get_user_name(sender_id)
+                    msg_text = (msg.get("text") if msg else None) or event.message or ""
                     parts = []
 
                     if event.from_chat and not event.from_me:
@@ -791,12 +781,32 @@ def vk_work():
                         if fwd:
                             parts.append(format_fwd_messages(fwd))
                         sender_line = f"*{escape_md(sender_name)}*"
-                        if event.message:
-                            sender_line += f": {escape_md(event.message)}"
+                        if msg_text:
+                            sender_line += f": {escape_md(msg_text)}"
                         parts.append(sender_line)
+                        if is_edit:
+                            parts.append("_✏️ изменено_")
+                        media_atts = []
+                        for att in attachments:
+                            if att.get("type") == "link":
+                                lnk = att["link"]
+                                url = lnk.get("url", "")
+                                if url and url not in msg_text:
+                                    title = escape_md(lnk.get("title", ""))
+                                    parts.append(f"🔗 {title}\n{escape_md(url)}" if title else f"🔗 {escape_md(url)}")
+                            elif att.get("type") == "video":
+                                v = att["video"]
+                                url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
+                                title = escape_md(v.get("title", "Видео"))
+                                parts.append(f"🎬 *{title}*\n{escape_md(url)}")
+                            elif att.get("type") == "audio":
+                                a = att["audio"]
+                                parts.append(f"🎵 *{escape_md(a.get('artist', '?'))} — {escape_md(a.get('title', '?'))}*")
+                            else:
+                                media_atts.append(att)
                         text = "\n".join(p for p in parts if p)
-                        if attachments:
-                            handle_attachments(attachments, caption=text, parse_mode="Markdown")
+                        if media_atts:
+                            handle_attachments(media_atts, caption=text, parse_mode="Markdown")
                         else:
                             broadcast(text, parse_mode="Markdown")
                         logger.info(f"Беседа '{chat_title}' → TG")
@@ -807,12 +817,32 @@ def vk_work():
                         if fwd:
                             parts.append(format_fwd_messages(fwd))
                         sender_line = f"*{escape_md(sender_name)}*"
-                        if event.message:
-                            sender_line += f": {escape_md(event.message)}"
+                        if msg_text:
+                            sender_line += f": {escape_md(msg_text)}"
                         parts.append(sender_line)
+                        if is_edit:
+                            parts.append("_✏️ изменено_")
+                        media_atts = []
+                        for att in attachments:
+                            if att.get("type") == "link":
+                                lnk = att["link"]
+                                url = lnk.get("url", "")
+                                if url and url not in msg_text:
+                                    title = escape_md(lnk.get("title", ""))
+                                    parts.append(f"🔗 {title}\n{escape_md(url)}" if title else f"🔗 {escape_md(url)}")
+                            elif att.get("type") == "video":
+                                v = att["video"]
+                                url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
+                                title = escape_md(v.get("title", "Видео"))
+                                parts.append(f"🎬 *{title}*\n{escape_md(url)}")
+                            elif att.get("type") == "audio":
+                                a = att["audio"]
+                                parts.append(f"🎵 *{escape_md(a.get('artist', '?'))} — {escape_md(a.get('title', '?'))}*")
+                            else:
+                                media_atts.append(att)
                         text = "\n".join(p for p in parts if p)
-                        if attachments:
-                            handle_attachments(attachments, caption=text, parse_mode="Markdown")
+                        if media_atts:
+                            handle_attachments(media_atts, caption=text, parse_mode="Markdown")
                         else:
                             broadcast(text, parse_mode="Markdown")
                         logger.info(f"Личка {sender_name} → TG")

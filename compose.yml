@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: vk2tgbot:v1.3
+    image: vk2tgbot:v1.4
     container_name: vk-to-telegram-bot
     restart: unless-stopped
     env_file:

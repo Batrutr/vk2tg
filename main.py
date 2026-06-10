@@ -5,8 +5,10 @@ import tempfile
 import requests
 import sys
 import random
+import html
 from functools import wraps
 from threading import Thread, Lock
+from collections import OrderedDict
 
 import vk_api
 import telebot
@@ -145,6 +147,18 @@ def vk_call(method, *args, retries: int = 0, backoff: float = 0.7, **kwargs):
 
 def next_random_id() -> int:
     return random.randint(1, 2_147_483_647)
+
+
+def _detect_self_id() -> int:
+    """Own VK user id of the token owner (used to ignore edits of our own messages)."""
+    try:
+        return int(vk_call(vk.users.get, retries=1)[0]["id"])
+    except Exception as e:
+        logger.warning(f"Не удалось определить собственный VK id: {e}")
+        return 0
+
+
+VK_SELF_ID = _detect_self_id()
 
 
 def get_user_name(user_id: int) -> str:
@@ -294,11 +308,22 @@ ALLOWED_PEER_IDS = get_allowed_peer_ids()
 
 # ─── Broadcast ────────────────────────────────────────────────────────────────
 
+def _without_parse_mode(kwargs: dict) -> dict:
+    return {k: v for k, v in kwargs.items() if k != "parse_mode"}
+
 def broadcast(text: str, **kwargs):
     for tid in get_tg_ids():
         try:
             tg.send_message(tid, text, **kwargs)
         except Exception as e:
+            if kwargs.get("parse_mode"):
+                # Most likely a Markdown parse error — resend as plain text
+                # so the forwarded message is not lost.
+                try:
+                    tg.send_message(tid, text, **_without_parse_mode(kwargs))
+                    continue
+                except Exception as e2:
+                    e = e2
             logger.error(f"broadcast → {tid}: {e}")
 
 def broadcast_media(method: str, *args, **kwargs):
@@ -307,6 +332,12 @@ def broadcast_media(method: str, *args, **kwargs):
         try:
             fn(tid, *args, **kwargs)
         except Exception as e:
+            if kwargs.get("parse_mode"):
+                try:
+                    fn(tid, *args, **_without_parse_mode(kwargs))
+                    continue
+                except Exception as e2:
+                    e = e2
             logger.error(f"broadcast_media({method}) → {tid}: {e}")
 
 # ─── TG utils ─────────────────────────────────────────────────────────────────
@@ -637,36 +668,111 @@ def on_audio(message):
 
 # ─── VK → TG ─────────────────────────────────────────────────────────────────
 
-def escape_md(text: str) -> str:
-    if not text:
-        return text
-    for ch in ("_", "*", "`", "["):
-        text = text.replace(ch, f"\\{ch}")
-    return text
+def esc(text: str) -> str:
+    """Escape text for Telegram HTML parse mode (& < >)."""
+    return html.escape(text or "", quote=False)
 
 
-def format_fwd_messages(fwd_messages: list, depth: int = 0) -> str:
+def esc_attr(url: str) -> str:
+    """Escape a URL for use inside an HTML attribute (href)."""
+    return html.escape(url or "", quote=True)
+
+
+def fwd_quote_lines(fwd_messages: list, depth: int = 0) -> list[str]:
+    """Forwarded VK messages as HTML lines meant to live inside a blockquote."""
     lines = []
     indent = "  " * depth
     for msg in fwd_messages:
         from_id = int(msg.get("from_id", 0) or 0)
-        name = escape_md(get_user_name(from_id) if from_id else f"ID{msg.get('from_id', '?')}")
-        text = escape_md(msg.get("text", ""))
-        lines.append(f"{indent}↪ _{name}: {text}_" if text else f"{indent}↪ _{name}_")
+        name = esc(get_user_name(from_id) if from_id else f"ID{msg.get('from_id', '?')}")
+        text = esc(msg.get("text", ""))
+        lines.append(f"{indent}↪ <b>{name}</b>: {text}" if text else f"{indent}↪ <b>{name}</b>")
         if msg.get("fwd_messages"):
-            lines.append(format_fwd_messages(msg["fwd_messages"], depth + 1))
-    return "\n".join(lines)
+            lines.extend(fwd_quote_lines(msg["fwd_messages"], depth + 1))
+    return lines
 
 
-def get_reply_text(message_data: dict) -> str:
+def reply_quote_line(reply: dict) -> str:
+    """Replied-to VK message as a single HTML line for a blockquote."""
     try:
-        reply = message_data["reply_message"]
-        name = escape_md(get_user_name(int(reply["from_id"])))
-        text = escape_md(reply["text"])
-        return f"↩ _{name}_: {text}"
+        name = esc(get_user_name(int(reply.get("from_id", 0) or 0)))
+        text = esc(reply.get("text", ""))
+        return f"↩ <b>{name}</b>: {text}" if text else f"↩ <b>{name}</b>"
     except Exception as e:
-        logger.error(f"get_reply_text: {e}")
-        return "↩ _ошибка получения ответа_"
+        logger.error(f"reply_quote_line: {e}")
+        return "↩ <i>ошибка получения ответа</i>"
+
+
+# Bodies already forwarded to TG, keyed by VK message_id. Right after a link or
+# video is posted, VK attaches a preview and fires MESSAGE_EDIT — an "edit" that
+# changes nothing visible. We skip it when the rendered body matches what we
+# already sent. Only touched from the single longpoll thread, so no lock needed.
+_forwarded_bodies: OrderedDict[int, str] = OrderedDict()
+_FORWARDED_CACHE_MAX = 2000
+
+
+def remember_forwarded(message_id: int, body: str) -> None:
+    _forwarded_bodies[message_id] = body
+    _forwarded_bodies.move_to_end(message_id)
+    while len(_forwarded_bodies) > _FORWARDED_CACHE_MAX:
+        _forwarded_bodies.popitem(last=False)
+
+
+def body_already_forwarded(message_id: int, body: str) -> bool:
+    return _forwarded_bodies.get(message_id) == body
+
+
+def build_message_parts(msg_text: str, sender_name: str, attachments: list,
+                        fwd: list, reply: dict | None,
+                        chat_title: str | None = None) -> tuple[list[str], list]:
+    """Render a VK message into TG (HTML) blocks plus leftover media attachments.
+
+    Blocks are joined with a blank line between them for readability;
+    `media_atts` are photos/voices/docs/stickers uploaded separately.
+    """
+    blocks: list[str] = []
+    if chat_title:
+        blocks.append(f"<b>{esc(chat_title)}</b>")
+
+    # Reply and forwarded messages share one Telegram blockquote.
+    quote_lines: list[str] = []
+    if reply:
+        quote_lines.append(reply_quote_line(reply))
+    if fwd:
+        quote_lines.extend(fwd_quote_lines(fwd))
+    if quote_lines:
+        quoted = "\n".join(quote_lines)
+        tag = "<blockquote expandable>" if len(quoted) > 300 else "<blockquote>"
+        blocks.append(f"{tag}{quoted}</blockquote>")
+
+    # Sender line + any link/video/audio note lines form the body block.
+    body_lines: list[str] = [f"<b>{esc(sender_name)}</b>" + (f": {esc(msg_text)}" if msg_text else "")]
+
+    media_atts = []
+    for att in attachments:
+        att_type = att.get("type")
+        if att_type == "link":
+            lnk = att.get("link", {})
+            url = lnk.get("url", "")
+            # The bare URL is already in msg_text; only add a separate line when
+            # the link carries something extra (a different url or a title).
+            if url and url not in msg_text:
+                title = lnk.get("title", "")
+                body_lines.append(
+                    f'🔗 <a href="{esc_attr(url)}">{esc(title)}</a>' if title else f"🔗 {esc(url)}"
+                )
+        elif att_type == "video":
+            v = att["video"]
+            url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
+            title = v.get("title", "Видео")
+            body_lines.append(f'🎬 <a href="{esc_attr(url)}">{esc(title)}</a>')
+        elif att_type == "audio":
+            a = att["audio"]
+            body_lines.append(f"🎵 <b>{esc(a.get('artist', '?'))} — {esc(a.get('title', '?'))}</b>")
+        else:
+            media_atts.append(att)
+    blocks.append("\n".join(body_lines))
+    return blocks, media_atts
 
 
 def handle_attachments(attachments: list, caption: str = "", parse_mode: str | None = None):
@@ -761,91 +867,48 @@ def vk_work():
                             logger.error(f"getById failed: {e}")
 
                     peer_id = (msg or {}).get("peer_id") or (
-                        2_000_000_000 + event.chat_id if event.from_chat else event.user_id
+                        CHAT_PEER_OFFSET + event.chat_id if event.from_chat else event.user_id
                     )
 
                     if peer_id not in ALLOWED_PEER_IDS:
                         logger.debug(f"peer_id={peer_id} не в разрешённых")
                         continue
 
+                    # vk_api sets from_me only on MESSAGE_NEW, never on edits, so
+                    # also match our own id to keep our own edited messages out.
+                    is_from_me = event.from_me or (
+                        msg is not None and int(msg.get("from_id", 0) or 0) == VK_SELF_ID
+                    )
+                    if is_from_me or not (event.from_chat or event.from_user):
+                        continue
+
                     sender_id = (msg or {}).get("from_id") or event.user_id
                     sender_name = get_user_name(sender_id)
                     msg_text = (msg.get("text") if msg else None) or event.message or ""
-                    parts = []
 
-                    if event.from_chat and not event.from_me:
-                        chat_title = get_chat_title(event.chat_id)
-                        parts.append(f"*{escape_md(chat_title)}*")
-                        if reply:
-                            parts.append(get_reply_text({"reply_message": reply}))
-                        if fwd:
-                            parts.append(format_fwd_messages(fwd))
-                        sender_line = f"*{escape_md(sender_name)}*"
-                        if msg_text:
-                            sender_line += f": {escape_md(msg_text)}"
-                        parts.append(sender_line)
-                        if is_edit:
-                            parts.append("_✏️ изменено_")
-                        media_atts = []
-                        for att in attachments:
-                            if att.get("type") == "link":
-                                lnk = att["link"]
-                                url = lnk.get("url", "")
-                                if url and url not in msg_text:
-                                    title = escape_md(lnk.get("title", ""))
-                                    parts.append(f"🔗 {title}\n{escape_md(url)}" if title else f"🔗 {escape_md(url)}")
-                            elif att.get("type") == "video":
-                                v = att["video"]
-                                url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
-                                title = escape_md(v.get("title", "Видео"))
-                                parts.append(f"🎬 *{title}*\n{escape_md(url)}")
-                            elif att.get("type") == "audio":
-                                a = att["audio"]
-                                parts.append(f"🎵 *{escape_md(a.get('artist', '?'))} — {escape_md(a.get('title', '?'))}*")
-                            else:
-                                media_atts.append(att)
-                        text = "\n".join(p for p in parts if p)
-                        if media_atts:
-                            handle_attachments(media_atts, caption=text, parse_mode="Markdown")
-                        else:
-                            broadcast(text, parse_mode="Markdown")
-                        logger.info(f"Беседа '{chat_title}' → TG")
+                    chat_title = get_chat_title(event.chat_id) if event.from_chat else None
+                    blocks, media_atts = build_message_parts(
+                        msg_text, sender_name, attachments, fwd, reply, chat_title
+                    )
+                    body = "\n\n".join(b for b in blocks if b)
 
-                    elif not event.from_me and event.from_user:
-                        if reply:
-                            parts.append(get_reply_text({"reply_message": reply}))
-                        if fwd:
-                            parts.append(format_fwd_messages(fwd))
-                        sender_line = f"*{escape_md(sender_name)}*"
-                        if msg_text:
-                            sender_line += f": {escape_md(msg_text)}"
-                        parts.append(sender_line)
-                        if is_edit:
-                            parts.append("_✏️ изменено_")
-                        media_atts = []
-                        for att in attachments:
-                            if att.get("type") == "link":
-                                lnk = att["link"]
-                                url = lnk.get("url", "")
-                                if url and url not in msg_text:
-                                    title = escape_md(lnk.get("title", ""))
-                                    parts.append(f"🔗 {title}\n{escape_md(url)}" if title else f"🔗 {escape_md(url)}")
-                            elif att.get("type") == "video":
-                                v = att["video"]
-                                url = f"https://vk.com/video{v['owner_id']}_{v['id']}"
-                                title = escape_md(v.get("title", "Видео"))
-                                parts.append(f"🎬 *{title}*\n{escape_md(url)}")
-                            elif att.get("type") == "audio":
-                                a = att["audio"]
-                                parts.append(f"🎵 *{escape_md(a.get('artist', '?'))} — {escape_md(a.get('title', '?'))}*")
-                            else:
-                                media_atts.append(att)
-                        text = "\n".join(p for p in parts if p)
-                        if media_atts:
-                            handle_attachments(media_atts, caption=text, parse_mode="Markdown")
-                        else:
-                            broadcast(text, parse_mode="Markdown")
-                        logger.info(f"Личка {sender_name} → TG")
+                    # VK attaches link/video previews via MESSAGE_EDIT; that edit
+                    # leaves the rendered body unchanged, so drop the duplicate.
+                    if is_edit and body_already_forwarded(event.message_id, body):
+                        logger.debug(f"MESSAGE_EDIT без изменений (превью VK), id={event.message_id}")
+                        continue
+                    remember_forwarded(event.message_id, body)
+
+                    text = body
+                    if is_edit:
+                        text += "\n\n<i>✏️ изменено</i>"
+                    if media_atts:
+                        handle_attachments(media_atts, caption=text, parse_mode="HTML")
+                    else:
+                        broadcast(text, parse_mode="HTML")
+                    logger.info(
+                        f"Беседа '{chat_title}' → TG" if chat_title else f"Личка {sender_name} → TG"
+                    )
 
                 except Exception as e:
                     logger.error(f"Ошибка обработки события: {e}")
